@@ -110,3 +110,33 @@ func CreateLayer(sourceDir string, storePath string, createdBy string) (LayerMet
 		CreatedBy: createdBy,
 	}, nil
 }
+
+// collectFiles recursively walks sourceDir and returns an unsorted slice of fileInfo entries.  
+// The caller sorts before creating the tar archive.
+func collectFiles(sourceDir string) ([]fileInfo, error) {
+	sourceDir = filepath.Clean(sourceDir)
+	var files []fileInfo
+	err := filepath.Walk(sourceDir, func(fullPath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return fmt.Errorf("error walking %s: %w", fullPath, err)
+		}
+		relPath, err := filepath.Rel(sourceDir, fullPath)
+		if err != nil {
+			return fmt.Errorf("failed to get relative path: %w", err)
+		}
+		// Skip the root directory itself.
+		if relPath == "." {
+			return nil
+		}
+		// Normalise to forward slashes so tar paths are identical on all platforms.
+		files = append(files, fileInfo{
+			path:     filepath.ToSlash(relPath),
+			fullPath: fullPath,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
+}
