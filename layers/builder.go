@@ -140,3 +140,112 @@ func collectFiles(sourceDir string) ([]fileInfo, error) {
 	}
 	return files, nil
 }
+
+// createDeterministicTar writes a tar archive from a pre-sorted slice of files.
+// Every entry has normalised metadata (zeroed timestamps, uid/gid = 0, no user/group names).
+// Mode bits are derived via tar.FileInfoHeader which correctly maps Go's os.FileMode to POSIX tar mode bits.
+// Preserving setuid/setgid/sticky while stripping the Go-internal file-type flags that must not appear in the Mode field of a tar header.
+func createDeterministicTar(files []fileInfo, tarPath string) error {
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		return fmt.Errorf("failed to create tar file: %w", err)
+	}
+	tw := tar.NewWriter(tarFile)
+	for _, file := range files {
+		if err := addFileToTar(tw, file); err != nil {
+			tarFile.Close()
+			return err
+		}
+	}
+	// Close tar writer first — writes end-of-archive marker.
+	if err := tw.Close(); err != nil {
+		tarFile.Close()
+		return fmt.Errorf("failed to finalise tar archive: %w", err)
+	}
+	// Close the underlying file explicitly so that any OS-level write error
+	// (full disk, quota exceeded, etc.) surfaces here rather than being silently swallowed by a deferred close.  
+	// A silent failure would store a corrupt tar and compute a wrong digest from it.
+	if err := tarFile.Close(); err != nil {
+		return fmt.Errorf("failed to flush tar to disk: %w", err)
+	}
+	return nil
+}
+
+// addFileToTar adds a single filesystem entry to tw with fully normalised metadata.
+// Mode bit handling:
+// tar.FileInfoHeader is used to convert os.FileMode → POSIX tar mode bits.
+// This is the only correct portable approach: os.FileMode stores file-type flags 
+// (e.g. os.ModeDir = 1<<31, os.ModeSymlink = 1<<27) in positions that are Go-internal and must not be written into a tar Mode field.  
+// Casting info.Mode() directly to int64 embeds these flags and produces a different digest on different Go versions or platforms.  
+// tar.FileInfoHeader performs the canonical conversion including setuid, setgid, and sticky bits.
+// Symlink handling:
+// Symlinks are followed and stored as regular files, avoiding dangling-link errors at extraction time and keeps the extractor simple.  
+// The symlink target's content and mode are used; the symlink name in the tar is the original path.
+func addFileToTar(tw *tar.Writer, file fileInfo) error {
+	info, err := os.Lstat(file.fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat %s: %w", file.path, err)
+	}
+	// Resolve symlinks: follow the link, then use the target's metadata.
+	// src is the path actually opened for content.
+	src := file.fullPath
+	if info.Mode()&os.ModeSymlink != 0 {
+		realPath, err := filepath.EvalSymlinks(file.fullPath)
+		if err != nil {
+			return fmt.Errorf("failed to follow symlink %s: %w", file.path, err)
+		}
+		// Re-stat the real target so tar.FileInfoHeader gets the correct size and mode.
+		info, err = os.Stat(realPath)
+		if err != nil {
+			return fmt.Errorf("failed to stat symlink target %s: %w", file.path, err)
+		}
+		src = realPath
+	}
+	// Build the header using the standard library function for correct mode mapping.
+	header, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return fmt.Errorf("failed to create tar header for %s: %w", file.path, err)
+	}
+	// Normalise all non-deterministic fields.
+	header.Name    = file.path
+	header.ModTime = ZeroTime()
+	header.Uid     = DeterministicUID
+	header.Gid     = DeterministicGID
+	header.Uname   = "" // omit username string — varies per machine
+	header.Gname   = "" // omit group name string — varies per machine
+	// Directories must end with "/" in tar archives.
+	if info.IsDir() {
+		header.Name = ensureTrailingSlash(header.Name)
+	}
+	// We followed symlinks above, so Typeflag may still be TypeSymlink from tar.FileInfoHeader using the original unsymlinked info.  Force TypeReg.
+	if header.Typeflag == tar.TypeSymlink {
+		header.Typeflag = tar.TypeReg
+		header.Linkname = ""
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		return fmt.Errorf("failed to write tar header for %s: %w", file.path, err)
+	}
+	// Write file content for regular files (and followed symlinks).
+	if !info.IsDir() {
+		// Use f (not file) to avoid shadowing the fileInfo parameter.
+		f, err := os.Open(src)
+		if err != nil {
+			return fmt.Errorf("failed to open %s for reading: %w", file.path, err)
+		}
+		defer f.Close()
+
+		if _, err := io.Copy(tw, f); err != nil {
+			return fmt.Errorf("failed to write content of %s: %w", file.path, err)
+		}
+	}
+
+	return nil
+}
+
+// ensureTrailingSlash ensures directory names in tar archives end with "/".
+func ensureTrailingSlash(path string) string {
+	if !strings.HasSuffix(path, "/") {
+		return path + "/"
+	}
+	return path
+}
