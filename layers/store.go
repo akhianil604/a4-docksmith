@@ -28,7 +28,6 @@ func EnsureStoreExists(storePath string) error {
 	return nil
 }
 
-
 // LayerExists reports whether the layer identified by digest is present in the store directory.  
 // Performs only a filesystem stat, does not verify the tar's contents match the digest.
 // Usage by Engineer 3 (Cache Engineer):
@@ -61,4 +60,58 @@ func DeleteLayer(digest string, storePath string) error {
 		return fmt.Errorf("layer %s not found in store", digest)
 	}
 	return fmt.Errorf("failed to delete layer %s: %w", digest, err)
+}
+
+// ListLayers returns the digest of every layer currently in storePath.
+// Entries that do not look like valid layer filenames are silently skipped.
+// Order is not guaranteed, callers must sort if needed.
+// Useful for Engineer 1 (CLI & Parser) when implementing `docksmith images` and for reconciling which layer files are referenced by any manifest.
+func ListLayers(storePath string) ([]string, error) {
+	entries, err := os.ReadDir(storePath)
+	if os.IsNotExist(err) {
+		// Store not yet initialised — that is fine, just return empty.
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read store directory %s: %w", storePath, err)
+	}
+	digests := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, LayerFileExtension) {
+			continue
+		}
+		digest := strings.TrimSuffix(name, LayerFileExtension)
+		if ValidateDigest(digest) != nil {
+			continue // e.g. temp.tar left from a crashed build
+		}
+		digests = append(digests, digest)
+	}
+
+	return digests, nil
+}
+
+// GetLayerInfo returns stored metadata for an existing layer.
+// The CreatedBy field is not encoded in the tar itself.
+// The caller should populate it from the image manifest after calling this function.
+func GetLayerInfo(digest, storePath string) (LayerMetadata, error) {
+	if err := ValidateDigest(digest); err != nil {
+		return LayerMetadata{}, fmt.Errorf("invalid digest %q: %w", digest, err)
+	}
+	path := LayerFilePath(digest, storePath)
+	stat, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return LayerMetadata{}, fmt.Errorf("layer %s not found in store", digest)
+		}
+		return LayerMetadata{}, fmt.Errorf("failed to stat layer %s: %w", digest, err)
+	}
+	return LayerMetadata{
+		Digest:    digest,
+		Size:      stat.Size(),
+		CreatedBy: "", // Retrieve from image manifest, not stored inside the tar
+	}, nil
 }
