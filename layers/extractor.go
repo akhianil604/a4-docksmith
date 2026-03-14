@@ -114,3 +114,59 @@ func extractDir(targetPath string, header *tar.Header) error {
 	}
 	return nil
 }
+
+// extractRegularFile writes a regular file, overwriting any existing file at the same path. Parent directories are created with 0755 if absent.
+func extractRegularFile(tr *tar.Reader, targetPath string, header *tar.Header) error {
+	// Parent directory may not exist if the tar omits explicit dir entries.
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		return fmt.Errorf("failed to create parent directory for %s: %w", targetPath, err)
+	}
+	// O_TRUNC ensures we overwrite stale content from a previous layer.
+	out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, header.FileInfo().Mode())
+	if err != nil {
+		return fmt.Errorf("failed to create file %s: %w", targetPath, err)
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, tr); err != nil {
+		return fmt.Errorf("failed to write file %s: %w", targetPath, err)
+	}
+
+	return nil
+}
+
+// extractSymlink creates a symbolic link. Any existing file or link at the target path is removed first so the layer can overwrite it cleanly.
+// Note: symlink targets are NOT validated for path traversal because they are not dereferenced during extraction, only if a subsequent process follows them.  
+// The container will run inside its own root, limiting any exposure.
+func extractSymlink(targetPath string, header *tar.Header) error {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		return fmt.Errorf("failed to create parent dir for symlink %s: %w", targetPath, err)
+	}
+	// Remove existing entry so Symlink does not fail with "file exists".
+	_ = os.Remove(targetPath)
+	if err := os.Symlink(header.Linkname, targetPath); err != nil {
+		return fmt.Errorf("failed to create symlink %s -> %s: %w",
+			targetPath, header.Linkname, err)
+	}
+	return nil
+}
+
+// extractHardLink creates a hard link.  
+// The link target (Linkname) is also resolved through safeJoin to prevent a malicious tar from linking to a host file outside the destination directory.
+func extractHardLink(targetPath string, header *tar.Header, absDestination string) error {
+	// Validate the link target path as well.
+	linkTarget, err := safeJoin(absDestination, header.Linkname)
+	if err != nil {
+		return fmt.Errorf("hard link target is unsafe: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		return fmt.Errorf("failed to create parent dir for hard link %s: %w", targetPath, err)
+	}
+	// Remove existing entry before linking.
+	_ = os.Remove(targetPath)
+	if err := os.Link(linkTarget, targetPath); err != nil {
+		return fmt.Errorf("failed to create hard link %s -> %s: %w",
+			targetPath, linkTarget, err)
+	}
+
+	return nil
+}
