@@ -254,3 +254,32 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// Helpers
+// tempDir creates a temporary directory and terminates the program if it fails.
+func tempDir(pattern string) string {
+	dir, err := os.MkdirTemp("", pattern)
+	if err != nil {
+		fatal("os.MkdirTemp(%q): %v", pattern, err)
+	}
+	return dir
+}
+
+// writeFile writes data to rel (a forward-slash path) inside parent.
+// Creates any missing parent directories and terminates on any error.
+func writeFile(parent, rel string, data []byte) {
+	full := filepath.Join(parent, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+		fatal("MkdirAll for %s: %v", rel, err)
+	}
+	if err := os.WriteFile(full, data, 0644); err != nil {
+		fatal("WriteFile %s: %v", rel, err)
+	}
+}
+
+// fatal prints a message to stderr and exits with code 2.
+// Used only for unrecoverable setup/teardown errors, not for test failures.
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "\nFATAL: "+format+"\n", args...)
+	os.Exit(2)
+}
