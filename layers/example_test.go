@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 )
 // Engineer 1 (Build Engine) — COPY and RUN layer creation
-
 // ExampleCreateLayer_copy shows how the build engine creates a layer for a COPY instruction.  
 // Pass the instruction string as createdBy so the returned LayerMetadata is immediately ready to be appended to the image manifest.
 func ExampleCreateLayer_copy() {
@@ -82,4 +81,106 @@ func ExampleCreateLayer_idempotent() {
 	}
 	fmt.Println("digests match:", meta1.Digest == meta2.Digest)
 	// Output: digests match: true
+}
+
+// Engineer 3 (Build Cache) — Checking layer existence
+// ExampleLayerExists shows the cache system checking whether a previously computed layer digest is still present on disk before declaring a cache hit.
+func ExampleLayerExists() {
+	storePath, err := DefaultStorePath()
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	// A well-formed digest that is (very likely) not in the store.
+	absentDigest := "sha256:" + fmt.Sprintf("%064x", 0)
+	fmt.Println("absent layer exists:", LayerExists(absentDigest, storePath))
+	// Output: absent layer exists: false
+}
+
+// Engineer 4 (Container Runtime) — Assembling a rootfs
+// ExampleExtractLayer shows the runtime extracting multiple layers in manifest order to build the container's root filesystem.
+func ExampleExtractLayer() {
+	storePath, err := DefaultStorePath()
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	if err := EnsureStoreExists(storePath); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	// Step 1: Create two layers to simulate a base layer and an app layer.
+	baseDir, err := os.MkdirTemp("", "docksmith-base-*")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	defer os.RemoveAll(baseDir)
+	appDir, err := os.MkdirTemp("", "docksmith-app-*")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	defer os.RemoveAll(appDir)
+	// Base layer: a /etc/os-release file.
+	etcDir := filepath.Join(baseDir, "etc")
+	if err := os.MkdirAll(etcDir, 0755); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(etcDir, "os-release"), []byte("ID=docksmith\n"), 0644); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	// App layer: overrides /etc/os-release and adds /app/main.py.
+	etcDir2 := filepath.Join(appDir, "etc")
+	appDirInLayer := filepath.Join(appDir, "app")
+	if err := os.MkdirAll(etcDir2, 0755); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	if err := os.MkdirAll(appDirInLayer, 0755); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(etcDir2, "os-release"), []byte("ID=myapp\n"), 0644); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(appDirInLayer, "main.py"), []byte("print('hello')"), 0644); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	baseMeta, err := CreateLayer(baseDir, storePath, "FROM alpine:3.18")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	appMeta, err := CreateLayer(appDir, storePath, "COPY . /app")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	// Step 2: Extract layers in order into a temporary rootfs directory.
+	rootfs, err := os.MkdirTemp("", "docksmith-rootfs-*")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	defer os.RemoveAll(rootfs)
+	// Manifest order: Base layer first, then the app layer (overwrites files).
+	for _, digest := range []string{baseMeta.Digest, appMeta.Digest} {
+		if err := ExtractLayer(digest, storePath, rootfs); err != nil {
+			fmt.Println("extract error:", err)
+			return
+		}
+	}
+	// Step 3: Verify the app layer's /etc/os-release wins over the base.
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "os-release"))
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("os-release after stacking: %s", data)
+	// Output: os-release after stacking: ID=myapp
 }
