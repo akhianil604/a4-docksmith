@@ -184,3 +184,43 @@ func ExampleExtractLayer() {
 	fmt.Printf("os-release after stacking: %s", data)
 	// Output: os-release after stacking: ID=myapp
 }
+
+// Example: Engineer 1 (CLI) — docksmith rmi
+// ExampleDeleteLayer shows how the rmi command removes layer files.  
+// All layers belonging to the removed image manifest are deleted in a loop.
+func ExampleDeleteLayer() {
+	storePath, err := DefaultStorePath()
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	if err := EnsureStoreExists(storePath); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	// Create a disposable layer to demonstrate deletion.
+	tmpDir, err := os.MkdirTemp("", "docksmith-del-*")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+	if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("delete me"), 0644); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	meta, err := CreateLayer(tmpDir, storePath, "COPY . /app")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("exists before delete:", LayerExists(meta.Digest, storePath))
+	if err := DeleteLayer(meta.Digest, storePath); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Println("exists after delete:", LayerExists(meta.Digest, storePath))
+	// Output:
+	// exists before delete: true
+	// exists after delete: false
+}
