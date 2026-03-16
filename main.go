@@ -69,7 +69,7 @@ func main() {
 	defer os.RemoveAll(storePath)
 	fmt.Printf("  store:    %s\n", storePath)
 	fmt.Printf("  cleanup:  deferred on exit\n")
-	
+
 	// Step 1: Build the source directory
 	header(1, 7, "Build source directory")
 	sourceDir := tempDir("docksmith-src-*")
@@ -163,5 +163,94 @@ func main() {
 				beforeStat.ModTime().Format(time.RFC3339Nano),
 				afterStat.ModTime().Format(time.RFC3339Nano)),
 		)
+	}
+
+	// Step 7: Layer stacking — later layer overwrites earlier 
+	header(7, 7, "Layer stacking (overwrite semantics)")
+	// Build a second source directory that contains only a modified README.md.
+	src2Dir := tempDir("docksmith-src2-*")
+	defer os.RemoveAll(src2Dir)
+	updatedReadme := []byte("# Version 2 — written by the second layer\n")
+	writeFile(src2Dir, "README.md", updatedReadme)
+	metaV2, err := layers.CreateLayer(src2Dir, storePath, "COPY README.md /")
+	if !t.check("CreateLayer (layer 2) returned no error", err) {
+		fatal("cannot run stacking test without second layer")
+	}
+	stackDir := tempDir("docksmith-stack-*")
+	defer os.RemoveAll(stackDir)
+	// Extract layer 1 (base), then layer 2 (delta) — same order as runtime.
+	if err := layers.ExtractLayer(meta.Digest, storePath, stackDir); err != nil {
+		fatal("extract layer 1 into stack: %v", err)
+	}
+	if err := layers.ExtractLayer(metaV2.Digest, storePath, stackDir); err != nil {
+		fatal("extract layer 2 into stack: %v", err)
+	}
+	// README.md must reflect the second layer.
+	got, err := os.ReadFile(filepath.Join(stackDir, "README.md"))
+	if t.check("README.md readable in stacked rootfs", err) {
+		t.expect(
+			"second layer's README.md wins over first layer's",
+			bytes.Equal(got, updatedReadme),
+			fmt.Sprintf("got %q, want %q", got, updatedReadme),
+		)
+	}
+	// app/main.py from layer 1 must still be present (layer 2 did not delete it).
+	_, err = os.Stat(filepath.Join(stackDir, "app", "main.py"))
+	t.expect(
+		"layer 1 files preserved after stacking layer 2",
+		err == nil,
+		"app/main.py missing — layer 2 incorrectly wiped layer 1 files",
+	)
+
+	// ListLayers & DeleteLayer 
+	section("ListLayers & DeleteLayer")
+	// At this point the store contains: meta.Digest and metaV2.Digest.
+	all, err := layers.ListLayers(storePath)
+	if t.check("ListLayers returned no error", err) {
+		t.expect(
+			"ListLayers reports 2 layers",
+			len(all) == 2,
+			fmt.Sprintf("got %d layers, want 2", len(all)),
+		)
+	}
+	// Delete the first layer.
+	t.check("DeleteLayer (layer 1) returned no error",
+		layers.DeleteLayer(meta.Digest, storePath))
+	t.expect(
+		"LayerExists → false after DeleteLayer",
+		!layers.LayerExists(meta.Digest, storePath),
+		"LayerExists still true after DeleteLayer",
+	)
+	t.expect(
+		"layer 2 still present after deleting layer 1",
+		layers.LayerExists(metaV2.Digest, storePath),
+		"second layer unexpectedly missing",
+	)
+	remaining, err := layers.ListLayers(storePath)
+	if t.check("ListLayers after delete returned no error", err) {
+		t.expect(
+			"ListLayers reports 1 layer after delete",
+			len(remaining) == 1,
+			fmt.Sprintf("got %d layers, want 1", len(remaining)),
+		)
+	}
+
+	// Results 
+	fmt.Printf("\n%s\n", lineBold)
+	if t.failed == 0 {
+		fmt.Printf(
+			"RESULT  %d passed  %d failed — ALL TESTS PASSED\n",
+			t.passed, t.failed,
+		)
+	} 
+	else {
+		fmt.Printf(
+			"RESULT  %d passed  %d failed — SOME TESTS FAILED\n",
+			t.passed, t.failed,
+		)
+	}
+	fmt.Printf("%s\n", lineBold)
+	if t.failed > 0 {
+		os.Exit(1)
 	}
 }
