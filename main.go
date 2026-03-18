@@ -3,40 +3,47 @@
 // Run from the docksmith/ directory:
 // go run main.go
 package main
+
 import (
 	"bytes"
+	"docksmith/layers"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
-	"docksmith/layers"
 )
+
 // Output helpers
 const (
 	lineThin = "─────────────────────────────────────────────────────────────────────────"
 	lineBold = "═════════════════════════════════════════════════════════════════════════"
 )
+
 func header(n, total int, title string) {
 	fmt.Printf("\n%s\n[%d/%d] %s\n%s\n", lineThin, n, total, title, lineThin)
 }
 func section(title string) {
 	fmt.Printf("\n%s\n[+] %s\n%s\n", lineThin, title, lineThin)
 }
-// Test tracker 
+
+// Test tracker
 type tracker struct {
 	passed int
 	failed int
 }
+
 // Pass records a named pass and prints it.
 func (t *tracker) pass(name string) {
 	fmt.Printf("  [PASS] %s\n", name)
 	t.passed++
 }
+
 // fail records a named failure, printing the reason.
 func (t *tracker) fail(name, reason string) {
 	fmt.Printf("  [FAIL] %s: %s\n", name, reason)
 	t.failed++
 }
+
 // Check passes if err == nil, otherwise fails with the error message.
 // Returns true on pass so callers can gate subsequent checks.
 func (t *tracker) check(name string, err error) bool {
@@ -47,6 +54,7 @@ func (t *tracker) check(name string, err error) bool {
 	t.pass(name)
 	return true
 }
+
 // Expect passes if cond is true, otherwise fails with reason.
 func (t *tracker) expect(name string, cond bool, reason string) {
 	if cond {
@@ -62,7 +70,7 @@ func main() {
 	fmt.Printf("\n%s\n", lineBold)
 	fmt.Println("Docksmith Layer System — Integration Test")
 	fmt.Printf("%s\n", lineBold)
-	// Setup: temp directories 
+	// Setup: temp directories
 	// A dedicated temp store keeps this test from polluting ~/.docksmith/layers.
 	fmt.Println("\n[Setup]")
 	storePath := tempDir("docksmith-store-*")
@@ -90,7 +98,7 @@ func main() {
 		fmt.Printf("  %-28s %d bytes\n", f.rel, len(f.data))
 	}
 
-	// Step 2: CreateLayer 
+	// Step 2: CreateLayer
 	header(2, 7, "CreateLayer")
 	meta, err := layers.CreateLayer(sourceDir, storePath, "COPY . /app")
 	if !t.check("CreateLayer returned no error", err) {
@@ -100,7 +108,7 @@ func main() {
 	fmt.Printf("  size:    %d bytes\n", meta.Size)
 	fmt.Printf("  tarFile: %s\n", layers.LayerFilePath(meta.Digest, storePath))
 
-	// Step 3: Layer in store 
+	// Step 3: Layer in store
 	header(3, 7, "Layer in store")
 	t.expect(
 		"LayerExists → true after CreateLayer",
@@ -108,7 +116,7 @@ func main() {
 		"expected LayerExists to return true immediately after CreateLayer",
 	)
 
-	// Step 4: ExtractLayer 
+	// Step 4: ExtractLayer
 	header(4, 7, "ExtractLayer")
 	destDir := tempDir("docksmith-dest-*")
 	defer os.RemoveAll(destDir)
@@ -116,7 +124,7 @@ func main() {
 	t.check("ExtractLayer returned no error",
 		layers.ExtractLayer(meta.Digest, storePath, destDir))
 
-	// Step 5: Verify extracted files 
+	// Step 5: Verify extracted files
 	header(5, 7, "Verify extracted files")
 	for _, f := range sourceFiles {
 		got, err := os.ReadFile(filepath.Join(destDir, filepath.FromSlash(f.rel)))
@@ -138,7 +146,7 @@ func main() {
 		"directory missing after extraction",
 	)
 
-	// Step 6: Determinism & immutability 
+	// Step 6: Determinism & immutability
 	header(6, 7, "Determinism & immutability")
 	// Capture the layer file's mtime before the second CreateLayer call.
 	layerPath := layers.LayerFilePath(meta.Digest, storePath)
@@ -165,7 +173,7 @@ func main() {
 		)
 	}
 
-	// Step 7: Layer stacking — later layer overwrites earlier 
+	// Step 7: Layer stacking — later layer overwrites earlier
 	header(7, 7, "Layer stacking (overwrite semantics)")
 	// Build a second source directory that contains only a modified README.md.
 	src2Dir := tempDir("docksmith-src2-*")
@@ -202,7 +210,7 @@ func main() {
 		"app/main.py missing — layer 2 incorrectly wiped layer 1 files",
 	)
 
-	// ListLayers & DeleteLayer 
+	// ListLayers & DeleteLayer
 	section("ListLayers & DeleteLayer")
 	// At this point the store contains: meta.Digest and metaV2.Digest.
 	all, err := layers.ListLayers(storePath)
@@ -235,15 +243,14 @@ func main() {
 		)
 	}
 
-	// Results 
+	// Results
 	fmt.Printf("\n%s\n", lineBold)
 	if t.failed == 0 {
 		fmt.Printf(
 			"RESULT  %d passed  %d failed — ALL TESTS PASSED\n",
 			t.passed, t.failed,
 		)
-	} 
-	else {
+	} else {
 		fmt.Printf(
 			"RESULT  %d passed  %d failed — SOME TESTS FAILED\n",
 			t.passed, t.failed,
