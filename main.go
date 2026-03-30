@@ -1,292 +1,338 @@
-// main.go is a self-contained integration test for the docksmith layer system.
-// Creates real files, calls every exported API function, and verifies results.
-// Run from the docksmith/ directory:
-// go run main.go
 package main
 
 import (
-	"bytes"
-	"docksmith/layers"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+	"sort"
+	"strings"
+	"text/tabwriter"
+
+	"docksmith/image"
+	"docksmith/layers"
+	"docksmith/parser"
+	"docksmith/state"
 )
 
-// Output helpers
-const (
-	lineThin = "─────────────────────────────────────────────────────────────────────────"
-	lineBold = "═════════════════════════════════════════════════════════════════════════"
-)
-
-func header(n, total int, title string) {
-	fmt.Printf("\n%s\n[%d/%d] %s\n%s\n", lineThin, n, total, title, lineThin)
-}
-func section(title string) {
-	fmt.Printf("\n%s\n[+] %s\n%s\n", lineThin, title, lineThin)
+type buildExecutor interface {
+	Build(BuildRequest) error
 }
 
-// Test tracker
-type tracker struct {
-	passed int
-	failed int
+type runExecutor interface {
+	Run(RunRequest) error
 }
 
-// Pass records a named pass and prints it.
-func (t *tracker) pass(name string) {
-	fmt.Printf("  [PASS] %s\n", name)
-	t.passed++
+type BuildRequest struct {
+	ImageName         string
+	ImageTag          string
+	ContextDir        string
+	DocksmithfilePath string
+	Instructions      []parser.Instruction
+	NoCache           bool
+	State             state.Paths
 }
 
-// fail records a named failure, printing the reason.
-func (t *tracker) fail(name, reason string) {
-	fmt.Printf("  [FAIL] %s: %s\n", name, reason)
-	t.failed++
+type RunRequest struct {
+	Image        image.Manifest
+	Command      []string
+	EnvOverrides map[string]string
+	State        state.Paths
 }
 
-// Check passes if err == nil, otherwise fails with the error message.
-// Returns true on pass so callers can gate subsequent checks.
-func (t *tracker) check(name string, err error) bool {
-	if err != nil {
-		t.fail(name, err.Error())
-		return false
-	}
-	t.pass(name)
-	return true
+type app struct {
+	images  image.Store
+	builder buildExecutor
+	runner  runExecutor
 }
 
-// Expect passes if cond is true, otherwise fails with reason.
-func (t *tracker) expect(name string, cond bool, reason string) {
-	if cond {
-		t.pass(name)
-	} else {
-		t.fail(name, reason)
-	}
-}
-
-// Entry point
 func main() {
-	t := &tracker{}
-	fmt.Printf("\n%s\n", lineBold)
-	fmt.Println("Docksmith Layer System — Integration Test")
-	fmt.Printf("%s\n", lineBold)
-	// Setup: temp directories
-	// A dedicated temp store keeps this test from polluting ~/.docksmith/layers.
-	fmt.Println("\n[Setup]")
-	storePath := tempDir("docksmith-store-*")
-	defer os.RemoveAll(storePath)
-	fmt.Printf("  store:    %s\n", storePath)
-	fmt.Printf("  cleanup:  deferred on exit\n")
+	paths, err := state.DefaultPaths()
+	exitOnErr(err)
+	exitOnErr(state.Ensure(paths))
 
-	// Step 1: Build the source directory
-	header(1, 7, "Build source directory")
-	sourceDir := tempDir("docksmith-src-*")
-	defer os.RemoveAll(sourceDir)
-	// sourceFiles is the delta that will become the layer.
-	// Path keys use forward slashes, the helper converts for the OS.
-	sourceFiles := []struct {
-		rel  string
-		data []byte
-	}{
-		{"README.md", []byte("# Docksmith Demo App\n")},
-		{"app/main.py", []byte("print(\"hello from docksmith\")\n")},
-		{"app/config.json", []byte("{\"version\": \"1.0\", \"name\": \"demo\"}\n")},
-		{"app/lib/utils.py", []byte("def greet(): return \"hello\"\n")},
-	}
-	for _, f := range sourceFiles {
-		writeFile(sourceDir, f.rel, f.data)
-		fmt.Printf("  %-28s %d bytes\n", f.rel, len(f.data))
+	application := app{
+		images:  image.NewStore(paths.ImagesDir),
+		builder: localBuilder{images: image.NewStore(paths.ImagesDir)},
+		runner:  localRunner{},
 	}
 
-	// Step 2: CreateLayer
-	header(2, 7, "CreateLayer")
-	meta, err := layers.CreateLayer(sourceDir, storePath, "COPY . /app")
-	if !t.check("CreateLayer returned no error", err) {
-		fatal("cannot continue without a valid layer: %v", err)
+	if err := application.run(os.Args[1:]); err != nil {
+		fail(err)
 	}
-	fmt.Printf("\n  digest:  %s\n", meta.Digest)
-	fmt.Printf("  size:    %d bytes\n", meta.Size)
-	fmt.Printf("  tarFile: %s\n", layers.LayerFilePath(meta.Digest, storePath))
+}
 
-	// Step 3: Layer in store
-	header(3, 7, "Layer in store")
-	t.expect(
-		"LayerExists → true after CreateLayer",
-		layers.LayerExists(meta.Digest, storePath),
-		"expected LayerExists to return true immediately after CreateLayer",
-	)
+func (a app) run(args []string) error {
+	if len(args) == 0 {
+		return usageError("")
+	}
 
-	// Step 4: ExtractLayer
-	header(4, 7, "ExtractLayer")
-	destDir := tempDir("docksmith-dest-*")
-	defer os.RemoveAll(destDir)
-	fmt.Printf("  destination: %s\n\n", destDir)
-	t.check("ExtractLayer returned no error",
-		layers.ExtractLayer(meta.Digest, storePath, destDir))
+	switch args[0] {
+	case "build":
+		return a.runBuild(args[1:])
+	case "images":
+		return a.runImages(args[1:])
+	case "rmi":
+		return a.runRMI(args[1:])
+	case "run":
+		return a.runContainer(args[1:])
+	case "help", "-h", "--help":
+		return usageError("")
+	default:
+		return usageError(fmt.Sprintf("unknown command %q", args[0]))
+	}
+}
 
-	// Step 5: Verify extracted files
-	header(5, 7, "Verify extracted files")
-	for _, f := range sourceFiles {
-		got, err := os.ReadFile(filepath.Join(destDir, filepath.FromSlash(f.rel)))
-		if err != nil {
-			t.fail(f.rel+" readable", err.Error())
-			continue
+func (a app) runBuild(args []string) error {
+	fs := flag.NewFlagSet("build", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	tag := fs.String("t", "", "image name and tag in name:tag form")
+	noCache := fs.Bool("no-cache", false, "skip cache lookups and writes")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(*tag) == "" {
+		return fmt.Errorf("build requires -t <name:tag>")
+	}
+	name, tagValue, err := parseImageRef(*tag)
+	if err != nil {
+		return fmt.Errorf("invalid build tag: %w", err)
+	}
+
+	if fs.NArg() != 1 {
+		return fmt.Errorf("build requires exactly one context directory")
+	}
+	contextDir, err := filepath.Abs(fs.Arg(0))
+	if err != nil {
+		return fmt.Errorf("resolve context directory: %w", err)
+	}
+	info, err := os.Stat(contextDir)
+	if err != nil {
+		return fmt.Errorf("context directory error: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("context path %q is not a directory", contextDir)
+	}
+
+	docksmithfilePath := filepath.Join(contextDir, "Docksmithfile")
+	instructions, err := parser.ParseFile(docksmithfilePath)
+	if err != nil {
+		return err
+	}
+
+	paths, err := state.DefaultPaths()
+	if err != nil {
+		return err
+	}
+
+	return a.builder.Build(BuildRequest{
+		ImageName:         name,
+		ImageTag:          tagValue,
+		ContextDir:        contextDir,
+		DocksmithfilePath: docksmithfilePath,
+		Instructions:      instructions,
+		NoCache:           *noCache,
+		State:             paths,
+	})
+}
+
+func (a app) runImages(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("images does not accept positional arguments")
+	}
+
+	manifests, err := a.images.List()
+	if err != nil {
+		return err
+	}
+
+	sort.Slice(manifests, func(i, j int) bool {
+		if manifests[i].Name != manifests[j].Name {
+			return manifests[i].Name < manifests[j].Name
 		}
-		t.expect(
-			f.rel+" content matches",
-			bytes.Equal(got, f.data),
-			fmt.Sprintf("got %q, want %q", got, f.data),
+		return manifests[i].Tag < manifests[j].Tag
+	})
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tTAG\tID\tCREATED")
+	for _, manifest := range manifests {
+		fmt.Fprintf(
+			w,
+			"%s\t%s\t%s\t%s\n",
+			manifest.Name,
+			manifest.Tag,
+			shortDigest(manifest.Digest),
+			manifest.Created,
 		)
 	}
-	// Verify subdirectory was recreated.
-	libInfo, err := os.Stat(filepath.Join(destDir, "app", "lib"))
-	t.expect(
-		"app/lib/ directory exists",
-		err == nil && libInfo.IsDir(),
-		"directory missing after extraction",
-	)
+	return w.Flush()
+}
 
-	// Step 6: Determinism & immutability
-	header(6, 7, "Determinism & immutability")
-	// Capture the layer file's mtime before the second CreateLayer call.
-	layerPath := layers.LayerFilePath(meta.Digest, storePath)
-	beforeStat, err := os.Stat(layerPath)
+func (a app) runRMI(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("rmi requires exactly one image reference in name:tag form")
+	}
+
+	name, tagValue, err := parseImageRef(args[0])
 	if err != nil {
-		fatal("cannot stat layer file: %v", err)
-	}
-	// Second call with identical source content.
-	meta2, err := layers.CreateLayer(sourceDir, storePath, "COPY . /app")
-	if t.check("second CreateLayer returned no error", err) {
-		t.expect(
-			"same content → same digest  (determinism)",
-			meta.Digest == meta2.Digest,
-			fmt.Sprintf("digest changed: first=%s  second=%s", meta.Digest, meta2.Digest),
-		)
-		// If digests are equal the file must not have been touched (immutability).
-		afterStat, _ := os.Stat(layerPath)
-		t.expect(
-			"layer file not overwritten on second CreateLayer  (immutability)",
-			!afterStat.ModTime().After(beforeStat.ModTime()),
-			fmt.Sprintf("mtime moved from %s → %s",
-				beforeStat.ModTime().Format(time.RFC3339Nano),
-				afterStat.ModTime().Format(time.RFC3339Nano)),
-		)
+		return fmt.Errorf("invalid image reference: %w", err)
 	}
 
-	// Step 7: Layer stacking — later layer overwrites earlier
-	header(7, 7, "Layer stacking (overwrite semantics)")
-	// Build a second source directory that contains only a modified README.md.
-	src2Dir := tempDir("docksmith-src2-*")
-	defer os.RemoveAll(src2Dir)
-	updatedReadme := []byte("# Version 2 — written by the second layer\n")
-	writeFile(src2Dir, "README.md", updatedReadme)
-	metaV2, err := layers.CreateLayer(src2Dir, storePath, "COPY README.md /")
-	if !t.check("CreateLayer (layer 2) returned no error", err) {
-		fatal("cannot run stacking test without second layer")
-	}
-	stackDir := tempDir("docksmith-stack-*")
-	defer os.RemoveAll(stackDir)
-	// Extract layer 1 (base), then layer 2 (delta) — same order as runtime.
-	if err := layers.ExtractLayer(meta.Digest, storePath, stackDir); err != nil {
-		fatal("extract layer 1 into stack: %v", err)
-	}
-	if err := layers.ExtractLayer(metaV2.Digest, storePath, stackDir); err != nil {
-		fatal("extract layer 2 into stack: %v", err)
-	}
-	// README.md must reflect the second layer.
-	got, err := os.ReadFile(filepath.Join(stackDir, "README.md"))
-	if t.check("README.md readable in stacked rootfs", err) {
-		t.expect(
-			"second layer's README.md wins over first layer's",
-			bytes.Equal(got, updatedReadme),
-			fmt.Sprintf("got %q, want %q", got, updatedReadme),
-		)
-	}
-	// app/main.py from layer 1 must still be present (layer 2 did not delete it).
-	_, err = os.Stat(filepath.Join(stackDir, "app", "main.py"))
-	t.expect(
-		"layer 1 files preserved after stacking layer 2",
-		err == nil,
-		"app/main.py missing — layer 2 incorrectly wiped layer 1 files",
-	)
-
-	// ListLayers & DeleteLayer
-	section("ListLayers & DeleteLayer")
-	// At this point the store contains: meta.Digest and metaV2.Digest.
-	all, err := layers.ListLayers(storePath)
-	if t.check("ListLayers returned no error", err) {
-		t.expect(
-			"ListLayers reports 2 layers",
-			len(all) == 2,
-			fmt.Sprintf("got %d layers, want 2", len(all)),
-		)
-	}
-	// Delete the first layer.
-	t.check("DeleteLayer (layer 1) returned no error",
-		layers.DeleteLayer(meta.Digest, storePath))
-	t.expect(
-		"LayerExists → false after DeleteLayer",
-		!layers.LayerExists(meta.Digest, storePath),
-		"LayerExists still true after DeleteLayer",
-	)
-	t.expect(
-		"layer 2 still present after deleting layer 1",
-		layers.LayerExists(metaV2.Digest, storePath),
-		"second layer unexpectedly missing",
-	)
-	remaining, err := layers.ListLayers(storePath)
-	if t.check("ListLayers after delete returned no error", err) {
-		t.expect(
-			"ListLayers reports 1 layer after delete",
-			len(remaining) == 1,
-			fmt.Sprintf("got %d layers, want 1", len(remaining)),
-		)
-	}
-
-	// Results
-	fmt.Printf("\n%s\n", lineBold)
-	if t.failed == 0 {
-		fmt.Printf(
-			"RESULT  %d passed  %d failed — ALL TESTS PASSED\n",
-			t.passed, t.failed,
-		)
-	} else {
-		fmt.Printf(
-			"RESULT  %d passed  %d failed — SOME TESTS FAILED\n",
-			t.passed, t.failed,
-		)
-	}
-	fmt.Printf("%s\n", lineBold)
-	if t.failed > 0 {
-		os.Exit(1)
-	}
-}
-
-// Helpers
-// tempDir creates a temporary directory and terminates the program if it fails.
-func tempDir(pattern string) string {
-	dir, err := os.MkdirTemp("", pattern)
+	manifest, path, err := a.images.Load(name, tagValue)
 	if err != nil {
-		fatal("os.MkdirTemp(%q): %v", pattern, err)
+		return err
 	}
-	return dir
+
+	paths, err := state.DefaultPaths()
+	if err != nil {
+		return err
+	}
+
+	for _, layer := range manifest.Layers {
+		if removeErr := layers.DeleteLayer(layer.Digest, paths.LayersDir); removeErr != nil && !strings.Contains(removeErr.Error(), "not found") {
+			return fmt.Errorf("remove layer %s: %w", layer.Digest, removeErr)
+		}
+	}
+
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove image manifest: %w", err)
+	}
+
+	fmt.Fprintf(os.Stdout, "Removed %s:%s\n", name, tagValue)
+	return nil
 }
 
-// writeFile writes data to rel (a forward-slash path) inside parent.
-// Creates any missing parent directories and terminates on any error.
-func writeFile(parent, rel string, data []byte) {
-	full := filepath.Join(parent, filepath.FromSlash(rel))
-	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-		fatal("MkdirAll for %s: %v", rel, err)
+func (a app) runContainer(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	var envVars multiValueFlag
+	fs.Var(&envVars, "e", "override environment variable (KEY=VALUE)")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	if err := os.WriteFile(full, data, 0644); err != nil {
-		fatal("WriteFile %s: %v", rel, err)
+
+	if fs.NArg() < 1 {
+		return fmt.Errorf("run requires an image reference")
 	}
+	name, tagValue, err := parseImageRef(fs.Arg(0))
+	if err != nil {
+		return fmt.Errorf("invalid image reference: %w", err)
+	}
+
+	manifest, _, err := a.images.Load(name, tagValue)
+	if err != nil {
+		return err
+	}
+
+	command := fs.Args()[1:]
+	if len(command) == 0 {
+		command = append(command, manifest.Config.Cmd...)
+	}
+	if len(command) == 0 {
+		return fmt.Errorf("image %s:%s has no CMD and no runtime command was provided", name, tagValue)
+	}
+
+	paths, err := state.DefaultPaths()
+	if err != nil {
+		return err
+	}
+
+	return a.runner.Run(RunRequest{
+		Image:        manifest,
+		Command:      command,
+		EnvOverrides: envVars.values,
+		State:        paths,
+	})
 }
 
-// fatal prints a message to stderr and exits with code 2.
-// Used only for unrecoverable setup/teardown errors, not for test failures.
-func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "\nFATAL: "+format+"\n", args...)
-	os.Exit(2)
+type multiValueFlag struct {
+	values map[string]string
+}
+
+func (m *multiValueFlag) String() string {
+	if len(m.values) == 0 {
+		return ""
+	}
+	pairs := make([]string, 0, len(m.values))
+	for key, value := range m.values {
+		pairs = append(pairs, key+"="+value)
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, ",")
+}
+
+func (m *multiValueFlag) Set(value string) error {
+	key, val, ok := strings.Cut(value, "=")
+	if !ok || strings.TrimSpace(key) == "" {
+		return fmt.Errorf("environment overrides must use KEY=VALUE form")
+	}
+	if m.values == nil {
+		m.values = map[string]string{}
+	}
+	m.values[key] = val
+	return nil
+}
+
+func parseImageRef(ref string) (string, string, error) {
+	name, tag, ok := strings.Cut(strings.TrimSpace(ref), ":")
+	if !ok || name == "" || tag == "" {
+		return "", "", fmt.Errorf("expected name:tag")
+	}
+	if strings.ContainsAny(name, "/\\ \t\r\n") || strings.ContainsAny(tag, "/\\ \t\r\n") {
+		return "", "", fmt.Errorf("image name and tag cannot contain whitespace or path separators")
+	}
+	return name, tag, nil
+}
+
+func shortDigest(digest string) string {
+	const prefix = "sha256:"
+	if strings.HasPrefix(digest, prefix) {
+		digest = strings.TrimPrefix(digest, prefix)
+	}
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
+}
+
+func formatMap(values map[string]string) string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, 0, len(keys))
+	for _, key := range keys {
+		pairs = append(pairs, key+"="+values[key])
+	}
+	return strings.Join(pairs, ", ")
+}
+
+func usageError(message string) error {
+	var b strings.Builder
+	if message != "" {
+		b.WriteString(message)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Usage:\n")
+	b.WriteString("  docksmith build -t <name:tag> [--no-cache] <context>\n")
+	b.WriteString("  docksmith images\n")
+	b.WriteString("  docksmith rmi <name:tag>\n")
+	b.WriteString("  docksmith run [-e KEY=VALUE] <name:tag> [cmd...]\n")
+	return errors.New(b.String())
+}
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, "Error:", err)
+	os.Exit(1)
+}
+
+func exitOnErr(err error) {
+	if err != nil {
+		fail(err)
+	}
 }
