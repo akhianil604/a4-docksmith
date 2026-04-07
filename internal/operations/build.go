@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,6 +11,7 @@ import (
 
 	"docksmith/cache"
 	"docksmith/imagestore"
+	"docksmith/isolation"
 	"docksmith/layers"
 )
 
@@ -373,19 +373,24 @@ func (b *builderState) applyCopy(arg string) error {
 	return copyPath(srcPath, destAbs)
 }
 
-// applyRun executes a RUN command in the build rootfs working directory.
+// applyRun executes a RUN command in the build rootfs using the shared isolation primitive.
 func (b *builderState) applyRun(arg string) error {
 	command := strings.TrimSpace(arg)
 	if command == "" {
 		return fmt.Errorf("RUN requires a command")
 	}
-	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Dir = resolveContainerPath(b.rootfs, b.workDir, ".")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), b.sortedEnvPairs()...)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("RUN failed: %w", err)
+
+	exitCode, err := isolation.Execute(isolation.Spec{
+		RootFS:     b.rootfs,
+		WorkingDir: defaultWorkingDir(b.workDir),
+		Env:        append([]string(nil), b.sortedEnvPairs()...),
+		Cmd:        []string{"/bin/sh", "-c", command},
+	})
+	if err != nil {
+		return fmt.Errorf("RUN isolation failed: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("RUN failed with exit code %d", exitCode)
 	}
 	return nil
 }
@@ -586,6 +591,14 @@ func resolveContainerPath(rootfs, workDir, pathSpec string) string {
 // trimLeadingSlash converts an absolute-style path into a rootfs-relative path.
 func trimLeadingSlash(v string) string {
 	return strings.TrimPrefix(filepath.ToSlash(v), "/")
+}
+
+// defaultWorkingDir returns / when image/build working directory is not set.
+func defaultWorkingDir(workDir string) string {
+	if strings.TrimSpace(workDir) == "" {
+		return "/"
+	}
+	return workDir
 }
 
 // envMapFromPairs converts KEY=VALUE strings into a map, skipping invalid entries.
