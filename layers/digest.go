@@ -1,5 +1,6 @@
 // Package layers provides digest computation for content-addressable storage
 package layers
+
 import (
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,10 +10,21 @@ import (
 	"path/filepath"
 	"strings"
 )
+
 // ComputeFileDigest computes the SHA256 digest of a file's contents.
 // Returns the digest in the format "sha256:<hex>".
 // Used for computing cache keys based on source files.
 func ComputeFileDigest(filePath string) (string, error) {
+	// Use Stat instead of Lstat to follow symlinks and ensure we have the actual file info
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat file %s: %w", filePath, err)
+	}
+	// Skip directories
+	if info.IsDir() {
+		return "", fmt.Errorf("path is a directory: %s", filePath)
+	}
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open file %s: %w", filePath, err)

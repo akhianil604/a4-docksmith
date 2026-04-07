@@ -452,6 +452,10 @@ func snapshotRootFS(root string) (fsSnapshot, error) {
 			s.dirs[rel] = struct{}{}
 			return nil
 		}
+		// Skip symlinks
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
 		hash, err := layers.ComputeFileDigest(path)
 		if err != nil {
 			return err
