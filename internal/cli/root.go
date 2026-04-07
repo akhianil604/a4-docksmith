@@ -9,6 +9,8 @@ func RootCmd() *cobra.Command {
 		Short:        "Docksmith container image tooling",
 	}
 
+	cmd.CompletionOptions.DisableDefaultCmd = true
+
 	cmd.AddCommand(
 		buildCmd(),
 		imagesCmd(),
