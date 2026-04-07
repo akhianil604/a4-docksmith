@@ -1,0 +1,6 @@
+FROM ubuntu:latest
+WORKDIR /app
+ENV GREETING=hello TARGET=world
+COPY run.sh /app/run.sh
+RUN chmod +x /app/run.sh
+CMD ["/bin/sh","-c","/app/run.sh"]

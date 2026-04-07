@@ -1,0 +1,6 @@
+FROM ubuntu:latest
+WORKDIR /app
+ENV MESSAGE=Hello-from-docksmith
+COPY message.txt /app/message.txt
+RUN echo "built-by-hello-basic" > /app/build-info.txt
+CMD ["/bin/sh","-c","echo \"$MESSAGE\" && cat /app/message.txt && cat /app/build-info.txt"]
