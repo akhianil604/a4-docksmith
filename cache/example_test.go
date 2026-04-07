@@ -161,7 +161,7 @@ func ExampleEngine_noCacheMode() {
 
 // ExampleCascadeMissSimulation demonstrates 4-step cascade behavior.
 // Once a miss occurs at any step, all following steps are treated as misses.
-func ExampleCascadeMissSimulation() {
+func Example_cascadeMissSimulation() {
 	steps := []string{"S1", "S2", "S3", "S4"}
 	// S4 exists in index, but should still be MISS once S3 misses.
 	index := map[string]string{
