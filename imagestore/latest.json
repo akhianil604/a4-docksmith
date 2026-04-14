@@ -1,0 +1,14 @@
+{
+  "name": "ubuntu",
+  "tag": "latest",
+  "digest": "sha256:placeholder",
+  "created": "2026-04-07T07:33:14Z",
+  "config": {
+    "Env": [],
+    "Cmd": ["/bin/sh"],
+    "WorkingDir": "/"
+  },
+  "layers": [
+    { "digest": "sha256:4c0667225a6c0d91241b15eaf72493b2c83218355adf06efddd18e388311edcd", "size": 75202560, "createdBy": "import ubuntu-fs" }
+  ]
+}

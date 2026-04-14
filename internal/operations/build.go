@@ -1,9 +1,11 @@
 package operations
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -83,6 +85,12 @@ func Build(opts *BuildOpts) error {
 	}
 
 	startTotal := time.Now()
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+	if existing, _, err := imagestore.LoadManifest(imagesPath, opts.Tag); err == nil && strings.TrimSpace(existing.Created) != "" {
+		createdAt = existing.Created
+	} else if err != nil && !strings.Contains(err.Error(), "not found") {
+		return err
+	}
 	rootfs, err := os.MkdirTemp("", "docksmith-build-rootfs-*")
 	if err != nil {
 		return fmt.Errorf("failed to create build rootfs: %w", err)
@@ -98,19 +106,15 @@ func Build(opts *BuildOpts) error {
 	}
 
 	for i, inst := range instructions {
-		stepStart := time.Now()
-		if err := b.executeInstruction(i+1, inst, imagesPath); err != nil {
+		if err := b.executeInstruction(i+1, len(instructions), inst, imagesPath); err != nil {
 			return err
-		}
-		if !isLayerProducing(inst.Op) {
-			fmt.Printf("STEP %02d %-7s [OK] %s\n", i+1, inst.Op, time.Since(stepStart).Round(time.Millisecond))
 		}
 	}
 
 	manifest := imagestore.Manifest{
 		Name:    name,
 		Tag:     tag,
-		Created: time.Now().UTC().Format(time.RFC3339),
+		Created: createdAt,
 		Config: imagestore.ManifestConfig{
 			Env:        b.sortedEnvPairs(),
 			Cmd:        append([]string(nil), b.cmd...),
@@ -123,7 +127,7 @@ func Build(opts *BuildOpts) error {
 		return err
 	}
 
-	fmt.Printf("BUILT %s:%s %s in %s\n", name, tag, finalManifest.Digest, time.Since(startTotal).Round(time.Millisecond))
+	fmt.Printf("Successfully built %s %s:%s (%s)\n", finalManifest.Digest, name, tag, time.Since(startTotal).Round(time.Millisecond))
 	return nil
 }
 
@@ -141,23 +145,34 @@ type builderState struct {
 }
 
 // executeInstruction routes a parsed instruction to its dedicated handler.
-func (b *builderState) executeInstruction(step int, inst buildInstruction, imagesPath string) error {
+func (b *builderState) executeInstruction(step, total int, inst buildInstruction, imagesPath string) error {
 	switch inst.Op {
 	case "FROM":
-		return b.handleFrom(inst, imagesPath)
+		if err := b.handleFrom(inst, imagesPath); err != nil {
+			return err
+		}
 	case "WORKDIR":
-		return b.handleWorkdir(inst)
+		if err := b.handleWorkdir(inst); err != nil {
+			return err
+		}
 	case "ENV":
-		return b.handleEnv(inst)
+		if err := b.handleEnv(inst); err != nil {
+			return err
+		}
 	case "CMD":
-		return b.handleCmd(inst)
+		if err := b.handleCmd(inst); err != nil {
+			return err
+		}
 	case "COPY":
-		return b.handleCopyOrRun(step, inst)
+		return b.handleCopyOrRun(step, total, inst)
 	case "RUN":
-		return b.handleCopyOrRun(step, inst)
+		return b.handleCopyOrRun(step, total, inst)
 	default:
 		return fmt.Errorf("unsupported instruction %q", inst.Op)
 	}
+
+	fmt.Printf("Step %d/%d : %s\n", step, total, inst.Raw)
+	return nil
 }
 
 // handleFrom loads a base image manifest and materializes its layers into the build rootfs.
@@ -220,32 +235,27 @@ func (b *builderState) handleCmd(inst buildInstruction) error {
 	if arg == "" {
 		return fmt.Errorf("CMD requires a value")
 	}
-	if strings.HasPrefix(arg, "[") && strings.HasSuffix(arg, "]") {
-		trimmed := strings.Trim(arg, "[]")
-		parts := strings.Split(trimmed, ",")
-		cmd := make([]string, 0, len(parts))
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			p = strings.Trim(p, "\"")
-			if p != "" {
-				cmd = append(cmd, p)
-			}
-		}
-		if len(cmd) == 0 {
-			return fmt.Errorf("CMD array is empty")
-		}
-		b.cmd = cmd
-		return nil
+	if !strings.HasPrefix(arg, "[") || !strings.HasSuffix(arg, "]") {
+		return fmt.Errorf("CMD requires JSON array form, got %q", arg)
 	}
-	b.cmd = strings.Fields(arg)
-	if len(b.cmd) == 0 {
-		return fmt.Errorf("CMD requires at least one token")
+	var cmd []string
+	if err := json.Unmarshal([]byte(arg), &cmd); err != nil {
+		return fmt.Errorf("invalid CMD JSON array: %w", err)
 	}
+	if len(cmd) == 0 {
+		return fmt.Errorf("CMD array is empty")
+	}
+	for _, part := range cmd {
+		if strings.TrimSpace(part) == "" {
+			return fmt.Errorf("CMD array entries cannot be empty")
+		}
+	}
+	b.cmd = append([]string(nil), cmd...)
 	return nil
 }
 
 // handleCopyOrRun performs cache lookup, executes COPY/RUN on miss, and records a layer.
-func (b *builderState) handleCopyOrRun(step int, inst buildInstruction) error {
+func (b *builderState) handleCopyOrRun(step, total int, inst buildInstruction) error {
 	copyFiles := []string{}
 	if inst.Op == "COPY" {
 		var err error
@@ -281,7 +291,7 @@ func (b *builderState) handleCopyOrRun(step int, inst buildInstruction) error {
 				CreatedBy: inst.Raw,
 			})
 			b.prevLayerDigest = digest
-			fmt.Printf("STEP %02d %-7s [CACHE HIT] %s\n", step, inst.Op, time.Since(start).Round(time.Millisecond))
+			fmt.Printf("Step %d/%d : %s [CACHE HIT] %s\n", step, total, inst.Raw, time.Since(start).Round(time.Millisecond))
 			return nil
 		}
 	}
@@ -329,48 +339,65 @@ func (b *builderState) handleCopyOrRun(step int, inst buildInstruction) error {
 		CreatedBy: inst.Raw,
 	})
 	b.prevLayerDigest = meta.Digest
-	fmt.Printf("STEP %02d %-7s [CACHE MISS] %s\n", step, inst.Op, time.Since(start).Round(time.Millisecond))
+	fmt.Printf("Step %d/%d : %s [CACHE MISS] %s\n", step, total, inst.Raw, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
 // copySourceFiles expands the COPY source argument into a deterministic list of files for cache hashing.
 func (b *builderState) copySourceFiles(arg string) ([]string, error) {
-	parts := strings.Fields(arg)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("COPY supports exactly two arguments: COPY <src> <dest>")
+	plan, err := b.resolveCopyPlan(arg)
+	if err != nil {
+		return nil, err
 	}
-	return expandCopySources(filepath.Join(b.contextDir, parts[0]))
+	if !plan.IsPattern {
+		return expandCopySources(plan.Sources[0].Abs)
+	}
+
+	files := make([]string, 0, len(plan.Sources))
+	for _, source := range plan.Sources {
+		files = append(files, source.Abs)
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // applyCopy applies a COPY instruction from context into the build rootfs.
 func (b *builderState) applyCopy(arg string) error {
-	parts := strings.Fields(arg)
-	if len(parts) != 2 {
-		return fmt.Errorf("COPY supports exactly two arguments: COPY <src> <dest>")
-	}
-	srcPath := filepath.Join(b.contextDir, parts[0])
-	if _, err := os.Stat(srcPath); err != nil {
-		return fmt.Errorf("COPY source not found: %s", parts[0])
-	}
-
-	destSpec := parts[1]
-	destAbs := resolveContainerPath(b.rootfs, b.workDir, destSpec)
-	st, err := os.Stat(srcPath)
+	plan, err := b.resolveCopyPlan(arg)
 	if err != nil {
 		return err
 	}
 
-	if st.IsDir() {
-		if err := copyDirectoryContents(srcPath, destAbs); err != nil {
+	if !plan.IsPattern {
+		srcPath := plan.Sources[0].Abs
+		st, err := os.Stat(srcPath)
+		if err != nil {
 			return err
 		}
-		return nil
+
+		destAbs := plan.DestAbs
+		if st.IsDir() {
+			return copyDirectoryContents(srcPath, destAbs)
+		}
+		if strings.HasSuffix(plan.DestSpec, "/") {
+			destAbs = filepath.Join(destAbs, filepath.Base(srcPath))
+		}
+		return copyPath(srcPath, destAbs)
 	}
 
-	if strings.HasSuffix(destSpec, "/") {
-		destAbs = filepath.Join(destAbs, filepath.Base(srcPath))
+	if len(plan.Sources) == 1 && !strings.HasSuffix(plan.DestSpec, "/") {
+		return copyPath(plan.Sources[0].Abs, plan.DestAbs)
 	}
-	return copyPath(srcPath, destAbs)
+	for _, source := range plan.Sources {
+		relTarget := source.Rel
+		if relTarget == "." || relTarget == "" {
+			relTarget = filepath.Base(source.Abs)
+		}
+		if err := copyPath(source.Abs, filepath.Join(plan.DestAbs, filepath.FromSlash(relTarget))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyRun executes a RUN command in the build rootfs using the shared isolation primitive.
@@ -428,6 +455,37 @@ func parseDocksmithfile(path string) ([]buildInstruction, error) {
 		return nil, fmt.Errorf("first instruction must be FROM")
 	}
 	return out, nil
+}
+
+type copySource struct {
+	Abs string
+	Rel string
+}
+
+type copyPlan struct {
+	Sources   []copySource
+	DestSpec  string
+	DestAbs   string
+	IsPattern bool
+}
+
+func (b *builderState) resolveCopyPlan(arg string) (copyPlan, error) {
+	parts := strings.Fields(arg)
+	if len(parts) != 2 {
+		return copyPlan{}, fmt.Errorf("COPY supports exactly two arguments: COPY <src> <dest>")
+	}
+
+	sources, isPattern, err := resolveCopySources(b.contextDir, parts[0])
+	if err != nil {
+		return copyPlan{}, err
+	}
+
+	return copyPlan{
+		Sources:   sources,
+		DestSpec:  parts[1],
+		DestAbs:   resolveContainerPath(b.rootfs, b.workDir, parts[1]),
+		IsPattern: isPattern,
+	}, nil
 }
 
 // snapshotRootFS captures file digests and directory paths for delta computation.
@@ -577,6 +635,139 @@ func expandCopySources(src string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+func resolveCopySources(contextDir, srcSpec string) ([]copySource, bool, error) {
+	if strings.TrimSpace(srcSpec) == "" {
+		return nil, false, fmt.Errorf("COPY source cannot be empty")
+	}
+	if filepath.IsAbs(srcSpec) {
+		return nil, false, fmt.Errorf("COPY source must stay inside the build context: %s", srcSpec)
+	}
+	if !isGlobPattern(srcSpec) {
+		absPath, err := joinWithinContext(contextDir, srcSpec)
+		if err != nil {
+			return nil, false, err
+		}
+		if _, err := os.Stat(absPath); err != nil {
+			return nil, false, fmt.Errorf("COPY source not found: %s", srcSpec)
+		}
+		return []copySource{{Abs: absPath, Rel: filepath.Base(absPath)}}, false, nil
+	}
+
+	pattern := normalizeSlashPath(srcSpec)
+	prefix := globFixedPrefix(pattern)
+	matches := []copySource{}
+	err := filepath.Walk(contextDir, func(pathname string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(contextDir, pathname)
+		if err != nil {
+			return err
+		}
+		rel = normalizeSlashPath(rel)
+		matched, err := matchGlobPattern(pattern, rel)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return nil
+		}
+
+		targetRel := rel
+		if prefix != "" {
+			targetRel = strings.TrimPrefix(rel, prefix)
+			targetRel = strings.TrimPrefix(targetRel, "/")
+			if targetRel == "" {
+				targetRel = path.Base(rel)
+			}
+		}
+		matches = append(matches, copySource{Abs: pathname, Rel: targetRel})
+		return nil
+	})
+	if err != nil {
+		return nil, true, err
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].Rel != matches[j].Rel {
+			return matches[i].Rel < matches[j].Rel
+		}
+		return matches[i].Abs < matches[j].Abs
+	})
+	if len(matches) == 0 {
+		return nil, true, fmt.Errorf("COPY source pattern %q matched no files", srcSpec)
+	}
+	return matches, true, nil
+}
+
+func joinWithinContext(contextDir, srcSpec string) (string, error) {
+	joined := filepath.Join(contextDir, filepath.FromSlash(srcSpec))
+	cleaned := filepath.Clean(joined)
+	rel, err := filepath.Rel(contextDir, cleaned)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve COPY source %s: %w", srcSpec, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("COPY source must stay inside the build context: %s", srcSpec)
+	}
+	return cleaned, nil
+}
+
+func isGlobPattern(spec string) bool {
+	return strings.ContainsAny(spec, "*?[")
+}
+
+func normalizeSlashPath(v string) string {
+	return strings.TrimPrefix(filepath.ToSlash(filepath.Clean(v)), "./")
+}
+
+func globFixedPrefix(pattern string) string {
+	segments := strings.Split(pattern, "/")
+	fixed := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if segment == "**" || strings.ContainsAny(segment, "*?[") {
+			break
+		}
+		fixed = append(fixed, segment)
+	}
+	return strings.Join(fixed, "/")
+}
+
+func matchGlobPattern(pattern, candidate string) (bool, error) {
+	return matchGlobSegments(strings.Split(pattern, "/"), strings.Split(candidate, "/"))
+}
+
+func matchGlobSegments(patternSegments, candidateSegments []string) (bool, error) {
+	if len(patternSegments) == 0 {
+		return len(candidateSegments) == 0, nil
+	}
+	if patternSegments[0] == "**" {
+		for i := 0; i <= len(candidateSegments); i++ {
+			matched, err := matchGlobSegments(patternSegments[1:], candidateSegments[i:])
+			if err != nil {
+				return false, err
+			}
+			if matched {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	if len(candidateSegments) == 0 {
+		return false, nil
+	}
+	matched, err := path.Match(patternSegments[0], candidateSegments[0])
+	if err != nil {
+		return false, fmt.Errorf("invalid COPY glob %q: %w", strings.Join(patternSegments, "/"), err)
+	}
+	if !matched {
+		return false, nil
+	}
+	return matchGlobSegments(patternSegments[1:], candidateSegments[1:])
 }
 
 // resolveContainerPath resolves a container path against rootfs and current workdir.

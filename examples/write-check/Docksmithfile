@@ -3,4 +3,4 @@ WORKDIR /work
 ENV OUTPUT_FILE=/work/generated.txt
 COPY task.sh /work/task.sh
 RUN chmod +x /work/task.sh
-CMD ["/bin/sh","-c","/work/task.sh && cat /work/generated.txt"]
+CMD ["/bin/sh","-c","/bin/sh /work/task.sh && cat \"$OUTPUT_FILE\""]

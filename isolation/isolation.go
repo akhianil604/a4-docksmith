@@ -49,8 +49,19 @@ func Execute(spec Spec) (int, error) {
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), specEnvKey+"="+payload)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:   syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID,
+		Cloneflags:   syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID,
 		Unshareflags: syscall.CLONE_NEWNS,
+		UidMappings: []syscall.SysProcIDMap{{
+			ContainerID: 0,
+			HostID:      os.Getuid(),
+			Size:        1,
+		}},
+		GidMappingsEnableSetgroups: false,
+		GidMappings: []syscall.SysProcIDMap{{
+			ContainerID: 0,
+			HostID:      os.Getgid(),
+			Size:        1,
+		}},
 	}
 
 	err = cmd.Run()
@@ -75,6 +86,10 @@ func ChildMain() int {
 	}
 	if err := syscall.Sethostname([]byte("docksmith")); err != nil {
 		fmt.Fprintln(os.Stderr, "sethostname failed:", err)
+		return 1
+	}
+	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+		fmt.Fprintln(os.Stderr, "mount propagation setup failed:", err)
 		return 1
 	}
 	if err := syscall.Chroot(spec.RootFS); err != nil {
